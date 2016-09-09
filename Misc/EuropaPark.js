@@ -1,6 +1,5 @@
 var Park = require("../parkBase");
 
-var request = require("request");
 var moment = require("moment-timezone");
 var crypto = require("crypto");
 
@@ -13,8 +12,9 @@ function EuropaPark(config) {
   self.name = self.name || "Europa-Park";
 
   // base API URL to use for requests
-  self.APIBase = self.APIBase || "https://apps.europapark.de/webservices/";
-  self.APIVersion = self.APIVersion || "4";
+  self.APIVersion = self.APIVersion || "api-1.1";
+  self.APIBase = self.APIBase || "https://api.europapark.de/" + self.APIVersion + "/";
+  self.TokenSecret = self.TokenSecret || "ZhQCqoZp";
 
   // Europa Park is in Germany
   self.park_timezone = "Europe/Berlin";
@@ -22,89 +22,114 @@ function EuropaPark(config) {
   // Call to parent class "Park" to inherit
   Park.call(self, config);
 
-  // unset default useragent
-  self.useragent = null;
-
-  // include our EuropaData asset (cut from PhoneGap app JS)
-  self.RideData = require(__dirname + "/EuropaData.json");
+  // set useragent
+  self.useragent = self.useragent || "okhttp/2.7.0";
 
   // generate a code => name object to speed up look-ups
-  self.RideNames = {};
-  for (var i = 0, ride; ride = self.RideData[i++];) {
-    self.RideNames[ride.code] = ride.en || ride.de || ride.fr;
-  }
+  self.RideNames = null;
 
   // opening data cache
   self._scheduleDataCache = null;
 
+  // grab ride names from the API
+  this.GetRideData = function(callback) {
+    if (self.RideNames != null) return callback(null, self.RideNames);
+
+    // download points of interest data
+    self.MakeNetworkRequest({
+      url: self.APIBase + "pointsofinterest",
+      json: true
+    }, function(err, resp, body) {
+      if (err) return self.Error("Error getting ride data", err, callback);
+      if (resp.statusCode !== 200) return self.Error("Error getting ride data", "Status code: " + resp.statusCode, callback);
+
+      self.RideNames = {};
+      for(var i=0, poi; poi=body[i++];) {
+        // not all attractions have English names, so fallback to German if missing
+        self.RideNames[poi.code] = poi.nameEnglish || poi.nameGerman;
+      }
+
+      return callback(null, self.RideNames);
+    })
+  };
+
   // get park wait times
   this.GetWaitTimes = function(callback) {
-    // now generate an access code to get wait times
-    var waitTimesAccessCode = self.GenerateWaittimesCodes();
+    self.GetRideData(function(err, rideNames) {
+      if (err) return self.Error("Error fetching ride names", err, callback);
 
-    // then fetch the wait times using the access code we created
-    self.MakeNetworkRequest({
-      url: self.APIBase + "waittimes/index.php",
-      data: {
-        "code": waitTimesAccessCode,
-        "v": self.APIVersion
-      },
-    }, function(err, resp, body) {
-      // check for standard network error for API response error
-      if (err) return self.Error("Error fetching wait times", err, callback);
+      // now generate an access code to get wait times
+      var waitTimesAccessCode = self.GenerateWaittimesCodes();
 
-      // API doesn't return a proper JSON object, so parse it here
-      var JSONData = body;
-      if (typeof(body) == "string") {
-        try {
-          JSONData = JSON.parse(body);
-        } catch (e) {
-          return self.Error("Failed to parse JSON data from Europa API", e + ": " + body, callback);
+      // then fetch the wait times using the access code we created
+      self.MakeNetworkRequest({
+        url: self.APIBase + "waitingtimes",
+        qs: {
+          "mock": false,
+          "token": waitTimesAccessCode
+        },
+        json: true
+      }, function(err, resp, body) {
+        // check for standard network error for API response error
+        if (err) return self.Error("Error fetching wait times", err, callback);
+        if (resp.statusCode !== 200) return self.Error("Error fetching wait times", "Status code: " + resp.statusCode, callback);
+        if (!body || body.length == 0) return self.Error("No data returned from Europa API", body, callback);
+
+        // build ride object
+        var rides = [];
+
+        for (var i = 0, ridetime; ridetime = body[i++];) {
+          // FYI, ridetime.type:
+          //   1: rollercoaster
+          //   2: water
+          //   3: adventure
+
+          // status meanings:
+          //  0: Open!
+          //  1: Wait time is over 90 minutes
+          //  2: Closed
+          //  3: Broken Down
+          //  4: Bad weather
+          //  5: VIP/Special Tour
+          //  other: Probably just crazy long wait times
+
+          // lowest wait time is 1 minute (according to app)
+          var waittime = ridetime.time > 0 ? ridetime.time : 0;
+          var active = (ridetime.status === 0 || ridetime.status === 1);
+          // copy how the app reacts to >90 minute waits
+          if (ridetime.status === 1) waittime = 91;
+          // is status is open, and ride has zero wait time, it is marked inactive
+          //  (copying how the app behaves, rides have minimum of 1 minute wait)
+          if (ridetime.status === 0 && ridetime.waittime == 0) {
+            active = false;
+          }
+
+          var ride = {
+            id: ridetime.code,
+            name: self.RideNames[ridetime.code],
+            waitTime: waittime,
+            active: active,
+            // Europa park doesn't have a fastpass-like system
+            fastPass: false,
+            status: active ? "Operating" : (ridetime.status === 3) ? "Down" : "Closed"
+          };
+
+          rides.push(ride);
         }
-      }
 
-      if (!JSONData || !JSONData.success) return self.Error("Europa API returned non-success result", JSONData, callback);
-      if (!JSONData.results) return self.Error("No results data present in wait times data", JSONData, callback);
-
-      // build ride object
-      var rides = [];
-
-      for (var i = 0, ridetime; ridetime = JSONData.results[i++];) {
-        // FYI, ridetime.type:
-        //   1: rollercoaster
-        //   2: water
-        //   3: adventure
-
-        rides.push({
-          id: ridetime.code,
-          name: self.RideNames[ridetime.code] || "??",
-          waitTime: parseInt(ridetime.time, 10),
-          // TODO
-          active: false,
-          // Europa doesn't have a fastpass-like system
-          fastPass: false,
-          // TODO
-          status: "Closed",
-        });
-      }
-
-      return callback(null, rides);
+        return callback(null, rides);
+      });
     });
   };
 
   // generate wait times access code
   this.GenerateWaittimesCodes = function() {
-    var currentParkDate = moment().tz(self.park_timezone).format("YYYYMMDDHHmm");
-    var hashString = "Europa-Park" + currentParkDate + "SecondTry";
-    self.Dbg("Generated Europa-Park hash string", hashString);
-    var md5Buffer = crypto.createHash('md5').update(hashString).digest();
-    var code = "";
-    for (var i = 0; i < md5Buffer.length; i++) {
-      code += ((0xF0 & md5Buffer[i]) >> 4).toString(16) + (0xF & md5Buffer[i]).toString(16);
-    }
-
+    var currentParkDate = moment.utc().format("YYYYMMDDHH");
+    self.Dbg("Calculated token date as", currentParkDate);
+    var hmac = crypto.createHmac('sha256', self.TokenSecret);
+    hmac.update(currentParkDate);
+    var code = hmac.digest('hex').toUpperCase();
     self.Dbg("Generated Europa wait times code", code);
-
     return code;
   };
 
@@ -117,19 +142,19 @@ function EuropaPark(config) {
 
     // request opening time object
     self.MakeNetworkRequest({
-      "url": self.APIBase + "opening.php",
+      "url": self.APIBase + "openingtimes",
       "json": true,
     }, function(err, resp, body) {
       if (err) return self.Error("Error getting opening schedule data", err, callback);
-
+      if (resp.statusCode !== 200) return self.Error("Error getting opening schedule data", "Status code: " + resp.statusCode, callback);
       if (!body || !body.length) return self.Error("No opening data returned by API", body, callback);
 
       // convert returned object into time parsed data with moment()
       var scheduleData = [];
       for (var i = 0, sched; sched = body[i++];) {
         scheduleData.push({
-          "startDate": moment.tz(sched.from, "DD.MM.YYYY", self.park_timezone),
-          "endDate": moment.tz(sched.till, "DD.MM.YYYY", self.park_timezone),
+          "startDate": moment.tz(sched.from, "YYYY-MM-DD", self.park_timezone),
+          "endDate": moment.tz(sched.until, "YYYY-MM-DD", self.park_timezone),
           "openingTime": sched.start,
           "closingTime": sched.end,
         });
